@@ -27,13 +27,14 @@ class _TiggerControllerAppState extends State<TiggerControllerApp> {
   BluetoothCharacteristic? _writeChar; 
   StreamSubscription? _notifySubscription;
   StreamSubscription? _connectionStateSubscription;
+  StreamSubscription? _scanSubscription;
 
   // ============================================================
-  // ✅ CONFIGURATION (Matches Arduino Code)
+  // CONFIGURATION
   // ============================================================
   final String UUID_SERVICE = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-  final String UUID_WRITE   = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; // App Writes to this
-  final String UUID_NOTIFY  = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"; // App Listens to this
+  final String UUID_WRITE   = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"; 
+  final String UUID_NOTIFY  = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
   // ============================================================
 
   @override
@@ -49,6 +50,18 @@ class _TiggerControllerAppState extends State<TiggerControllerApp> {
           _handleWebMessage(message.message);
         },
       )
+      // ✅ FIX 1: SYNC STATE ON REFRESH
+      // This detects when the website reloads and restores the connection status
+      ..setNavigationDelegate(
+        NavigationDelegate(
+          onPageFinished: (String url) {
+            if (_connectedDevice != null) {
+              // We are already connected, so force the website to turn Green immediately
+              _sendToWeb('STATUS', 'CONNECTED');
+            }
+          },
+        ),
+      )
       // REPLACE WITH YOUR GITHUB URL
       ..loadRequest(Uri.parse('https://pokpong40622.github.io/tiggerwebsitedemo/'));
   }
@@ -57,6 +70,7 @@ class _TiggerControllerAppState extends State<TiggerControllerApp> {
   void dispose() {
     _notifySubscription?.cancel();
     _connectionStateSubscription?.cancel();
+    _scanSubscription?.cancel();
     super.dispose();
   }
 
@@ -67,10 +81,18 @@ class _TiggerControllerAppState extends State<TiggerControllerApp> {
       final action = data['action'];
       
       if (action == 'CONNECT') {
-        await _startManualScan();
-      } else if (action == 'DISCONNECT') {
+        // ✅ FIX 2: PREVENT DOUBLE CONNECT
+        // If already connected, just update UI. Don't scan again.
+        if (_connectedDevice != null) {
+           _sendToWeb('STATUS', 'CONNECTED');
+        } else {
+           await _smartScanAndConnect();
+        }
+      } 
+      else if (action == 'DISCONNECT') {
         await _disconnectDevice();
-      } else if (action == 'WRITE') {
+      } 
+      else if (action == 'WRITE') {
         final cmd = data['payload']['data'];
         await _writeToDevice(cmd);
       }
@@ -85,136 +107,157 @@ class _TiggerControllerAppState extends State<TiggerControllerApp> {
     _webController.runJavaScript("receiveDataFromApp('$jsonStr')");
   }
 
-  // === 3. Manual Scan Logic ===
-  Future<void> _startManualScan() async {
+  // === 3. SMART CONNECT LOGIC ===
+  Future<void> _smartScanAndConnect() async {
     await [Permission.bluetoothScan, Permission.bluetoothConnect, Permission.location].request();
 
+    _sendToWeb('STATUS', 'SCANNING');
+
+    bool deviceFound = false;
+
     try {
-      await FlutterBluePlus.startScan(timeout: const Duration(seconds: 15));
-      if (!mounted) return;
-
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (BuildContext context) {
-          return AlertDialog(
-            title: const Text("Select TiggerSmart"),
-            content: SizedBox(
-              width: double.maxFinite,
-              height: 300,
-              child: StreamBuilder<List<ScanResult>>(
-                stream: FlutterBluePlus.scanResults,
-                builder: (context, snapshot) {
-                  if (!snapshot.hasData || snapshot.data!.isEmpty) {
-                    return const Center(child: Text("Scanning..."));
-                  }
-                  
-                  final devices = snapshot.data!
-                      .where((r) => r.device.platformName.isNotEmpty)
-                      .toList();
-
-                  if (devices.isEmpty) return const Center(child: Text("No named devices found."));
-
-                  return ListView.builder(
-                    itemCount: devices.length,
-                    itemBuilder: (context, index) {
-                      final result = devices[index];
-                      return ListTile(
-                        leading: const Icon(Icons.bluetooth),
-                        title: Text(result.device.platformName),
-                        subtitle: Text(result.device.remoteId.toString()),
-                        onTap: () {
-                          FlutterBluePlus.stopScan();
-                          Navigator.pop(context);
-                          _connectToDevice(result.device);
-                        },
-                      );
-                    },
-                  );
-                },
-              ),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () {
-                  FlutterBluePlus.stopScan();
-                  Navigator.pop(context);
-                  _sendToWeb('ERROR', 'User Cancelled Scan');
-                },
-                child: const Text("Cancel"),
-              ),
-            ],
-          );
-        },
+      await FlutterBluePlus.startScan(
+        withNames: ["TiggerSmart"], 
+        timeout: const Duration(seconds: 4)
       );
+
+      _scanSubscription = FlutterBluePlus.scanResults.listen((results) async {
+        if (results.isNotEmpty && !deviceFound) {
+          ScanResult r = results.first;
+          
+          if (r.device.platformName == "TiggerSmart") {
+            deviceFound = true;
+            await FlutterBluePlus.stopScan();
+            _connectToDevice(r.device); 
+          }
+        }
+      });
+
+      await Future.delayed(const Duration(seconds: 4));
+      await _scanSubscription?.cancel();
+
+      if (!deviceFound) {
+        if (mounted) _showManualList(); 
+      }
+
     } catch (e) {
-      _sendToWeb('ERROR', 'Scan Start Failed: $e');
+      _sendToWeb('ERROR', 'Scan Error: $e');
     }
   }
 
-  // === 4. Connection Logic ===
+  // === 4. Manual List ===
+  void _showManualList() async {
+    await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text("Device Not Found Automatically"),
+          content: SizedBox(
+            width: double.maxFinite,
+            height: 300,
+            child: Column(
+              children: [
+                const Padding(
+                  padding: EdgeInsets.only(bottom: 10),
+                  child: Text("Select manually:", style: TextStyle(fontSize: 12, color: Colors.grey)),
+                ),
+                Expanded(
+                  child: StreamBuilder<List<ScanResult>>(
+                    stream: FlutterBluePlus.scanResults,
+                    builder: (context, snapshot) {
+                      if (!snapshot.hasData || snapshot.data!.isEmpty) {
+                        return const Center(child: Text("Scanning..."));
+                      }
+                      
+                      final devices = snapshot.data!
+                          .where((r) => r.device.platformName.isNotEmpty)
+                          .toList();
+
+                      if (devices.isEmpty) return const Center(child: Text("No named devices found."));
+
+                      return ListView.builder(
+                        itemCount: devices.length,
+                        itemBuilder: (context, index) {
+                          final result = devices[index];
+                          return ListTile(
+                            leading: const Icon(Icons.bluetooth),
+                            title: Text(result.device.platformName),
+                            subtitle: Text(result.device.remoteId.toString()),
+                            onTap: () {
+                              FlutterBluePlus.stopScan();
+                              Navigator.pop(context);
+                              _connectToDevice(result.device);
+                            },
+                          );
+                        },
+                      );
+                    },
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                FlutterBluePlus.stopScan();
+                Navigator.pop(context);
+                _sendToWeb('STATUS', 'DISCONNECTED');
+              },
+              child: const Text("Cancel"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // === 5. Connection Logic ===
   Future<void> _connectToDevice(BluetoothDevice device) async {
     try {
       _sendToWeb('STATUS', 'CONNECTING...');
 
-      // 1. Connect
       await device.connect(license: License.free, autoConnect: false);
       _connectedDevice = device;
 
-      // 2. Listen for Disconnects
       _connectionStateSubscription = device.connectionState.listen((state) {
         if (state == BluetoothConnectionState.disconnected) {
            _sendToWeb('STATUS', 'DISCONNECTED');
+           _connectedDevice = null; // Mark as null so we know to reconnect next time
         }
       });
 
-      // 3. Discover Services
       await Future.delayed(const Duration(milliseconds: 1000));
       List<BluetoothService> services = await device.discoverServices();
       
-      // --- DEBUG LOGGING (FIXED: No more substring crash) ---
-      for (var s in services) {
-         // This now prints the FULL UUID safely
-         _sendToWeb('ERROR', "DEBUG: Found Svc ${s.uuid.toString()}");
-      }
-      // ------------------------------------------------------
-
-      // 4. Find Service (Case Insensitive)
       BluetoothService targetService = services.firstWhere(
         (s) => s.uuid.toString().toLowerCase() == UUID_SERVICE.toLowerCase(),
-        orElse: () => throw Exception("Service Not Found (Check Log)"),
+        orElse: () => throw Exception("Service Not Found"),
       );
       
-      // 5. Get Characteristics
       var chars = targetService.characteristics;
-
-      // Find Write Char
       try {
         _writeChar = chars.firstWhere((c) => c.uuid.toString().toLowerCase() == UUID_WRITE.toLowerCase());
-      } catch (e) {
-        throw Exception("Write Char Not Found");
-      }
+      } catch (e) { throw Exception("Write Char Not Found"); }
 
-      // Find Notify Char
       BluetoothCharacteristic notifyChar;
       try {
         notifyChar = chars.firstWhere((c) => c.uuid.toString().toLowerCase() == UUID_NOTIFY.toLowerCase());
-      } catch (e) {
-        throw Exception("Notify Char Not Found");
-      }
+      } catch (e) { throw Exception("Notify Char Not Found"); }
 
-      // 6. Setup Notifications
       await notifyChar.setNotifyValue(true);
       _notifySubscription = notifyChar.lastValueStream.listen((value) {
         String stringData = utf8.decode(value);
         _sendToWeb('NOTIFICATION', stringData);
       });
 
-      // 7. Success
       _sendToWeb('STATUS', 'CONNECTED');
 
     } catch (e) {
-      _sendToWeb('ERROR', 'Fail: $e');
+      _sendToWeb('ERROR', 'Connection Fail: $e');
       await _disconnectDevice();
     }
   }
@@ -235,7 +278,6 @@ class _TiggerControllerAppState extends State<TiggerControllerApp> {
     }
   }
 
-  // === 5. UI ===
   @override
   Widget build(BuildContext context) {
     return Scaffold(
